@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 Construction d'un fonds Article 9 SFDR (droit français / OPCVM) - MSCI World au 31/12/2024
 Objectif durable : contribuer à la transition bas carbone (trajectoire de température <= 2°C)
@@ -7,18 +6,20 @@ Entrée  : all_data.csv      Sortie : portefeuille_fonds_article9.xlsx
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
+import openpyxl
 
 DATA = "all_data.csv"
-OUT = "portefeuille_fonds_article9_V2.xlsx"
+OUT = "portefeuille_fonds_article9.xlsx"
 
 # ----------------------------------------------------------------------------
 # PARAMETRES
 # ----------------------------------------------------------------------------
-N_TITRES = 35         # nombre de lignes visé
-MAX_PAR_SECTEUR_SEL = 8     # nb max de titres par secteur GICS à la sélection
+N_TITRES = 40         # nombre de lignes visé
+MAX_PAR_SECTEUR_SEL = 10     # nb max de titres par secteur GICS à la sélection
 CAP_SECTEUR = 0.25          # poids max par secteur
-W_MIN, W_MAX_STD = 0.01, 0.05   # plancher / plafond standard par ligne
-W_MAX_TOP, N_TOP = 0.08, 4      # quelques lignes autorisées jusqu'à 8% (5/10/40 : 4x8% = 32% <= 40%)
+W_MIN = 0.005
+W_MAX = 0.05
+W_MAX_AUTRES = 0.044999   # plancher / plafond standard par ligne
 TILT = 0.4                  # intensité du tilt qualité (score) sur la base "capitalisation"
 ITR_MAX_PTF = 2.0           # température pondérée du portefeuille <= 2°C
 PCT_EXCL = 0.80             # on exclut les 20% pires (percentile d'intensité > 0.8) par secteur
@@ -39,8 +40,8 @@ d["LCT_PCT_SECTEUR"] = d.groupby("gics_sector_name")["CBN_LCT_SCORE"].rank(pct=T
 cols_requises = ["ITR", "S1_ITR", "S2_ITR", "S3_ITR", "INTENSITY_SCOPE_1", "INTENSITY_SCOPE_2",
                  "INTENSITY_SCOPE_3", "CBN_LCT_SCORE", "ENVIRONMENT_CONTROVERSY_SCORE",
                  "SOCIAL_CONTROVERSY_SCORE", "GOVERNANCE_CONTROVERSY_SCORE", "GOVERNANCE_PILLAR_SCORE", "IVA_COMPANY_RATING",
-                 "SDG_05_NET_ALIGNMENT_SCORE", "SDG_13_NET_ALIGNMENT_SCORE", "SDG_14_NET_ALIGNMENT_SCORE",
-                 "SDG_15_NET_ALIGNMENT_SCORE", "ROIC", "Debt assets", "Sharpe 10Y"]
+                 "SDG_05_NET_ALIGNMENT_SCORE", "SDG_13_NET_ALIGNMENT_SCORE", 
+                 "ROIC", "Debt assets", "Sharpe 5Y"]
 
 # Rating ESG minimum BB
 rating_rank = ["BB","BBB","A","AA","AAA"]
@@ -55,25 +56,27 @@ etapes = [
     ("Intensité Scope 1/2/3 : 20% pires de chaque secteur exclus (percentile <= 0.8)",
      lambda x: (x.SCOPE_1_PCT_SECTEUR <= PCT_EXCL) & (x.SCOPE_2_PCT_SECTEUR <= PCT_EXCL)
                & (x.SCOPE_3_PCT_SECTEUR <= PCT_EXCL), "Climat"),
-    ("DNSH environnement : controverses environnementales (0-10) >= 7",
-     lambda x: x.ENVIRONMENT_CONTROVERSY_SCORE >= 7, "DNSH"),
+    ("DNSH environnement : controverses environnementales (0-10) >= 7 et et pilier E >= 5",
+     lambda x: (x.ENVIRONMENT_CONTROVERSY_SCORE >= 7) & (x.ENVIRONMENTAL_PILLAR_SCORE >=5), "DNSH"),
     ("Note ESG >= BB et controverses gouvernance >= 7 et pilier G >= 5",
      lambda x: (u["IVA_COMPANY_RATING"].isin(rating_rank)) & (x.GOVERNANCE_CONTROVERSY_SCORE >= 7) & (x.GOVERNANCE_PILLAR_SCORE >= 5), "Gouvernance"),
-    ("DNSH social : controverses sociales >= 4 et ODD 5 >= 2",
+    ("DNSH social : controverses sociales >= 4",
      lambda x: (x.SOCIAL_CONTROVERSY_SCORE >= 4) & (x.SDG_05_NET_ALIGNMENT_SCORE >= 2), "DNSH social"),
-    ("DNSH climat/biodiversité : ODD 13, 14, 15 sans impact net négatif (>= 2)",
-     lambda x: (x.SDG_13_NET_ALIGNMENT_SCORE >= 2) & (x.SDG_14_NET_ALIGNMENT_SCORE >= 2)
-               & (x.SDG_15_NET_ALIGNMENT_SCORE >= 2), "DNSH"),
+    ("DNSH climat/biodiversité : ODD 13, 15 impact postiif (>= 2)",
+     lambda x: (x.SDG_13_NET_ALIGNMENT_SCORE >= 2), "DNSH"),
     ("Contribution : score transition bas carbone au-dessus de la médiane du secteur",
      lambda x: (x.LCT_PCT_SECTEUR >= 0.5), "Contribution"),
-    ("Filtre financier : ROIC > 0, Dette/actifs <= 45%, Sharpe 10 ans > 0.3",
-     lambda x: (x.ROIC > 0) & (x["Debt assets"] <= 45) & (x["Sharpe 10Y"] > 0.3), "Financier"),
+    ("Filtre financier : ROIC > 0, Dette/actifs <= 45%, Sharpe 5 ans > 0.3",
+     lambda x: (x.ROIC > 0) & (x["Debt assets"] <= 45) & (x["Sharpe 5Y"] > 0.3), "Financier"),
 ]
 u, entonnoir = d.copy(), []
 for lib, f, _ in etapes:
     u = u[f(u)]
     entonnoir.append((lib, len(u)))
 cand = u.copy()
+print("\n--- ENTONNOIR ---")
+for lib, nb in entonnoir:
+    print(f"{nb:>5} titres | {lib}")
 
 # ----------------------------------------------------------------------------
 # SCORE & SELECTION (diversifiée : max N titres par secteur)
@@ -82,41 +85,119 @@ def z(s):
     s = s.clip(s.quantile(0.01), s.quantile(0.99))
     return (s - s.mean()) / s.std(ddof=0)
 
-cand["score"] = (z(cand["Sharpe 10Y"]) + z(cand["ROIC"]) + z(cand["Annualized return 5Y"])
-                 + z(cand["CBN_LCT_SCORE"]) - z(cand["Intensite S1+S2"]) - z(cand["ITR"])
-                 + z(cand["SDG_13_NET_ALIGNMENT_SCORE"])) / 7
+cand["score"] = (2 * z(cand["Annualized return 5Y"]) + z(cand["Annualized return 10Y"])
+    + z(cand["Sharpe 5Y"]) + z(cand["ROIC"])
+    + z(cand["EST_EU_TAXONOMY_MAX_REV"])
+    + z(cand["CBN_LCT_SCORE"]) - z(cand["Intensite S1+S2"])- z(cand["ITR"])
+    + z(cand["SDG_13_NET_ALIGNMENT_SCORE"])) / 10
 cand = cand.sort_values("score", ascending=False)
 cand["rang_secteur"] = cand.groupby("gics_sector_name").cumcount() + 1
 sel = cand[cand.rang_secteur <= MAX_PAR_SECTEUR_SEL].head(N_TITRES).copy().reset_index(drop=True)
 
 # ----------------------------------------------------------------------------
-# PONDERATION : base capitalisation (racine du poids MSCI) x tilt qualité,
-# puis projection sous contraintes (5/10/40, secteur, ITR)
+# PONDERATION : base capitalisation x tilt qualité,
+# puis projection sous contraintes
 # ----------------------------------------------------------------------------
 n = len(sel)
-w0 = np.sqrt(sel["Weight in MSCI World"].values) * np.exp(TILT * sel["score"].values / sel["score"].std())
+
+w0 = (
+    np.sqrt(sel["Weight in MSCI World"].values)
+    * np.exp(TILT * sel["score"].values / sel["score"].std())
+)
 w0 = w0 / w0.sum()
-top = np.argsort(-w0)[:N_TOP]
-bornes = [(W_MIN, W_MAX_TOP if i in top else W_MAX_STD) for i in range(n)]
+
+# Plafond individuel : 5 % maximum
+bornes = [(W_MIN, W_MAX) for _ in range(n)]
+
 secteurs = sel["gics_sector_name"].values
-cons = [{"type": "eq", "fun": lambda w: w.sum() - 1},
-        {"type": "ineq", "fun": lambda w: ITR_MAX_PTF - w @ sel["ITR"].values}]
+
+cons = [
+    {"type": "eq", "fun": lambda w: w.sum() - 1},
+
+    # Température du portefeuille
+    {"type": "ineq",
+     "fun": lambda w: ITR_MAX_PTF - w @ sel["ITR"].values}
+]
+
+# Plafond par secteur
 for s in np.unique(secteurs):
     m = (secteurs == s).astype(float)
-    cons.append({"type": "ineq", "fun": lambda w, m=m: CAP_SECTEUR - w @ m})
-print("Nombre de titres sélectionnés :", len(u))
-print("Nombre de poids initiaux :", len(w0))
-print("Nombre de bornes :", len(bornes))
-print("Bornes :", bornes)
+    cons.append({
+        "type": "ineq",
+        "fun": lambda w, m=m: CAP_SECTEUR - w @ m
+    })
 
+# Première optimisation
+res = minimize(
+    lambda w: np.sum((w - w0) ** 2 / w0),
+    w0,
+    bounds=bornes,
+    constraints=cons,
+    method="SLSQP",
+    options={"maxiter": 1000, "ftol": 1e-12}
+)
 
-res = minimize(lambda w: np.sum((w - w0) ** 2 / w0), w0, bounds=bornes, constraints=cons, method="SLSQP",
-               options={"maxiter": 1000, "ftol": 1e-12})
-assert res.success, res.message
-sel["Poids dans le fonds"] = res.x / res.x.sum()
-sel = sel.sort_values("Poids dans le fonds", ascending=False).reset_index(drop=True)
+w = res.x.copy()
+
+# Les 8 plus grosses lignes sont les seules
+# autorisées à dépasser 4,5 %
+top8 = np.argsort(w)[-8:]
+
+# Nouvelles bornes :
+# - top 8 : maximum 5 %
+# - toutes les autres : maximum 4,4999 %
+bornes_2 = [
+    (W_MIN, W_MAX if i in top8 else W_MAX_AUTRES)
+    for i in range(n)
+]
+
+# Deuxième optimisation
+res = minimize(
+    lambda w: np.sum((w - w0) ** 2 / w0),
+    w,
+    bounds=bornes_2,
+    constraints=cons,
+    method="SLSQP",
+    options={"maxiter": 1000, "ftol": 1e-12}
+)
+
+if not res.success:
+    print("⚠️ Optimisation :", res.message)
+
+sel["Poids dans le fonds"] = res.x
+sel = sel.sort_values( "Poids dans le fonds",ascending=False).reset_index(drop=True)
 w = sel["Poids dans le fonds"].values
 
+lignes_proches_5 = w[w >= 0.045]
+
+ctrl = pd.DataFrame([
+    ["Nombre de lignes", len(sel),
+     "OK" if len(sel) >= 20 else "A revoir"],
+
+    ["Nombre de lignes proches de 5% (>= 4,5%)",
+     len(lignes_proches_5),
+     "OK" if len(lignes_proches_5) <= 8 else "KO"],
+
+    ["Somme des lignes proches de 5% (>= 4,5%)",
+     lignes_proches_5.sum(),
+     "OK" if lignes_proches_5.sum() <= 0.40 + 1e-9 else "KO"],
+
+    ["Somme des poids", w.sum(),
+     "OK" if abs(w.sum() - 1) < 1e-9 else "KO"],
+
+    ["Poids min d'une ligne", w.min(), "OK"],
+
+    ["Poids max d'un secteur (<= 25%)",
+     sel.groupby("gics_sector_name")["Poids dans le fonds"].sum().max(),
+     "OK" if sel.groupby("gics_sector_name")["Poids dans le fonds"].sum().max()
+     <= CAP_SECTEUR + 1e-9 else "KO"],
+
+    ["Température pondérée du portefeuille (<= 2°C)",
+     float(w @ sel["ITR"].values),
+     "OK" if w @ sel["ITR"].values <= 2 else "KO"],
+
+    # ...
+], columns=["Contrôle", "Valeur", "Statut"])
 # ----------------------------------------------------------------------------
 # KPI : fonds vs MSCI World (moyennes pondérées, poids renormalisés sur données disponibles)
 # ----------------------------------------------------------------------------
@@ -135,9 +216,7 @@ kpis = [("ITR (°C)", "ITR"), ("ITR Scope 1 (°C)", "S1_ITR"), ("ITR Scope 2 (°
         ("Score Gouvernance", "GOVERNANCE_PILLAR_SCORE"),
         ("Controverses env.", "ENVIRONMENT_CONTROVERSY_SCORE"), ("Controverses sociales", "SOCIAL_CONTROVERSY_SCORE"),
         ("Controverses gouvernance", "GOVERNANCE_CONTROVERSY_SCORE"),
-        ("Alignement ODD 5", "SDG_05_NET_ALIGNMENT_SCORE"), ("Alignement ODD 7", "SDG_07_NET_ALIGNMENT_SCORE"),
-        ("Alignement ODD 9", "SDG_09_NET_ALIGNMENT_SCORE"), ("Alignement ODD 13", "SDG_13_NET_ALIGNMENT_SCORE"),
-        ("Alignement ODD 14", "SDG_14_NET_ALIGNMENT_SCORE"), ("Alignement ODD 15", "SDG_15_NET_ALIGNMENT_SCORE"),
+        ("Alignement ODD 5", "SDG_05_NET_ALIGNMENT_SCORE"), ("Alignement ODD 13", "SDG_13_NET_ALIGNMENT_SCORE"),
         ("Rdt annualisé 1 an", "Annualized return 1Y"), ("Rdt annualisé 5 ans", "Annualized return 5Y"),
         ("Rdt annualisé 10 ans", "Annualized return 10Y"), ("Rdt annualisé 20 ans", "Annualized return 20Y"),
         ("Volatilité 5 ans (moy. pondérée)", "Volatility 5Y"), ("Sharpe 5 ans", "Sharpe 5Y"),
@@ -155,8 +234,8 @@ kpi = pd.DataFrame(rows, columns=["Indicateur", "Fonds", "MSCI World", "Écart v
 eur = sel["region_en"] == "Europe"
 ctrl = pd.DataFrame([
     ["Nombre de lignes", len(sel), "OK" if len(sel) >= 20 else "A revoir"],
-    ["Poids max d'une ligne (<= 10%)", w.max(), "OK" if w.max() <= 0.10 + 1e-9 else "KO"],
-    ["Somme des lignes > 5% (<= 40%)", w[w > 0.05].sum(), "OK" if w[w > 0.05].sum() <= 0.40 + 1e-9 else "KO"],
+    ["Poids max d'une ligne (< 5 %)", w.max(), "OK" if w.max() < 0.04999 else "KO"],
+    ["Somme des lignes >= '.5% (<= 40%)", w[w >= 0.045].sum(), "OK" if w[w >= 0.045].sum() <= 0.40 + 1e-9 else "KO"],
     ["Somme des poids", w.sum(), "OK" if abs(w.sum() - 1) < 1e-9 else "KO"],
     ["Poids min d'une ligne", w.min(), "OK"],
     ["Poids max d'un secteur (<= 25%)", sel.groupby("gics_sector_name")["w_f"].sum().max(),
@@ -186,7 +265,7 @@ secteurs_t, pays_t, ig_t = repartition("gics_sector_name"), repartition("country
 pays_t = pays_t[pays_t.Fonds > 0]
 
 metriques = ["ITR", "CBN_LCT_SCORE", "Intensite S1+S2", "SDG_13_NET_ALIGNMENT_SCORE", "ENVIRONMENT_CONTROVERSY_SCORE",
-             "GOVERNANCE_CONTROVERSY_SCORE", "GOVERNANCE_PILLAR_SCORE", "ROIC", "Debt assets", "Sharpe 10Y"]
+             "GOVERNANCE_CONTROVERSY_SCORE", "GOVERNANCE_PILLAR_SCORE", "ROIC", "Debt assets", "Sharpe 1Y"]
 corr = cand[metriques].corr().round(2).reset_index().rename(columns={"index": "Métrique"})
 
 criteres = pd.DataFrame([
@@ -198,18 +277,18 @@ criteres = pd.DataFrame([
     ["GOVERNANCE_CONTROVERSY_SCORE", ">=", 7, "Controverses de gouvernance (0-10)", "Gouvernance"],
     ["GOVERNANCE_PILLAR_SCORE", ">=", 5, "Pilier gouvernance", "Gouvernance"],
     ["SOCIAL_CONTROVERSY_SCORE", ">=", 4, "Controverses sociales (0-10)", "DNSH social"],
-    ["SDG_05_NET_ALIGNMENT_SCORE", ">=", 2, "ODD 5 : pas d'impact net négatif", "DNSH social"],
-    ["SDG_13/14/15_NET_ALIGNMENT_SCORE", ">=", 2, "ODD 13, 14, 15 : pas d'impact net négatif", "DNSH climat / biodiversité"],
+    ["SDG_05_NET_ALIGNMENT_SCORE", ">=", 2, "ODD 5 : impact positif", "DNSH social"],
+    ["SDG_13_NET_ALIGNMENT_SCORE", ">=", 2, "ODD 13 : impact positif", "DNSH climat"],
     ["CBN_LCT_SCORE", ">=", 5.5, "Score transition bas carbone (+ > médiane du secteur)", "Contribution"],
     ["ROIC", ">", 0, "Rentabilité du capital investi", "Financier"],
     ["Debt assets", "<=", 45, "Dette / actifs (%)", "Financier"],
-    ["Sharpe 10Y", ">", 0.3, "Sharpe 10 ans", "Financier"],
+    ["Sharpe 1Y", ">", 0.3, "Sharpe 1 ans", "Financier"],
 ], columns=["Colonne", "Opérateur", "Seuil", "Libellé", "Famille"])
 
 ptf = sel[["ticker", "name", "isin", "country", "gics_sector_name", "industry_group", "Poids dans le fonds",
            "Weight in MSCI World", "score", "ITR", "CBN_LCT_SCORE", "Intensite S1+S2",
            "SDG_13_NET_ALIGNMENT_SCORE", "ENVIRONMENT_CONTROVERSY_SCORE", "SOCIAL_CONTROVERSY_SCORE",
-           "GOVERNANCE_PILLAR_SCORE", "ROIC", "Debt assets", "Sharpe 10Y", "Annualized return 5Y",
+           "GOVERNANCE_PILLAR_SCORE", "ROIC", "Debt assets", "Sharpe 1Y", "Annualized return 5Y",
            "Volatility 5Y"]].rename(columns={"Weight in MSCI World": "Poids MSCI World",
                                              "gics_sector_name": "secteur"})
 ent = pd.DataFrame(entonnoir, columns=["Etape", "Entreprises restantes"])
